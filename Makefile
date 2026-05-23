@@ -1,111 +1,104 @@
-##### Global variables #####
-include version.mk Makefile.defs
+# Copyright 2024 HAMi Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-HAMI_VERSION_PKG=github.com/Project-HAMi/HAMi/pkg
+# Build variables
+BINARY_NAME ?= hami
+VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE  ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+GO_VERSION  ?= $(shell go version | awk '{print $$3}')
 
-ifndef GITHUB_ACTIONS
-	REVISION?=$(shell git rev-parse --short HEAD)
-else
-	REVISION=$(GITHUB_SHA)
-endif
+# Image variables
+REGISTRY    ?= ghcr.io/hami-project
+IMG_TAG     ?= $(VERSION)
 
-##### The ldflags for the go build process to set the version related data.
-GO_BUILD_LDFLAGS=\
-	-s \
-	-w \
-	-X $(HAMI_VERSION_PKG)/version.version=$(VERSION)  \
-	-X $(HAMI_VERSION_PKG)/device-plugin/nvidiadevice/nvinternal/info.version=$(VERSION) \
-	-X $(HAMI_VERSION_PKG)/version.revision=$(REVISION)  \
-	-X $(HAMI_VERSION_PKG)/version.buildDate=$(shell date +"%Y%m%d-%T")
+# Go build flags
+LD_FLAGS := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)"
+GO_FLAGS := -trimpath $(LD_FLAGS)
 
+# Directories
+OUTPUT_DIR  := bin
+CMD_DIR     := cmd
+
+.PHONY: all build clean test lint fmt vet docker-build docker-push help
+
+## all: Build all binaries
 all: build
 
-docker:
-	docker build \
-	--build-arg GOLANG_IMAGE=${GOLANG_IMAGE} \
-	--build-arg TARGET_ARCH=${TARGET_ARCH} \
-	--build-arg NVIDIA_IMAGE=${NVIDIA_IMAGE} \
-	--build-arg DEST_DIR=${DEST_DIR} \
-	--build-arg VERSION=${VERSION} \
-	--build-arg GOPROXY=https://goproxy.cn,direct \
-	. -f=docker/Dockerfile -t ${IMG_NAME}:${IMG_TAG}
+## build: Build the project binaries
+build:
+	@echo "Building $(BINARY_NAME) version=$(VERSION) commit=$(COMMIT)"
+	@mkdir -p $(OUTPUT_DIR)
+	go build $(GO_FLAGS) -o $(OUTPUT_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/...
 
-dockerwithlib:
-	docker build \
-	--no-cache \
-	--build-arg GOLANG_IMAGE=${GOLANG_IMAGE} \
-	--build-arg TARGET_ARCH=${TARGET_ARCH} \
-	--build-arg NVIDIA_IMAGE=${NVIDIA_IMAGE} \
-	--build-arg DEST_DIR=${DEST_DIR} \
-	--build-arg VERSION=${VERSION} \
-	--build-arg GOPROXY=https://goproxy.cn,direct \
-	. -f=docker/Dockerfile.withlib -t ${IMG_NAME}:${IMG_TAG}
-
-tidy:
-	$(GO) mod tidy
-
-proto:
-	$(GO) get github.com/gogo/protobuf/protoc-gen-gofast@v1.3.2
-	protoc --gofast_out=plugins=grpc:. ./pkg/api/*.proto
-
-build: $(CMDS) $(DEVICES)
-
-$(CMDS):
-	$(GO) build -ldflags '$(GO_BUILD_LDFLAGS)' -o ${OUTPUT_DIR}/$@ ./cmd/$@
-
-$(DEVICES):
-	$(GO) build -ldflags '$(GO_BUILD_LDFLAGS)' -o ${OUTPUT_DIR}/$@-device-plugin ./cmd/device-plugin/$@
-
+## clean: Remove build artifacts
 clean:
-	$(GO) clean -r -x ./cmd/...
-	-rm -rf $(OUTPUT_DIR)
+	@echo "Cleaning build artifacts..."
+	@rm -rf $(OUTPUT_DIR)
 
-.PHONY: all build docker clean test $(CMDS)
-
+## test: Run unit tests
 test:
-	mkdir -p ./_output/coverage/
-	bash hack/unit-test.sh
+	@echo "Running unit tests..."
+	go test -v -race -coverprofile=coverage.out ./...
 
+## test-coverage: Show test coverage report
+test-coverage: test
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated: coverage.html"
+
+## lint: Run golangci-lint
 lint:
-	bash hack/verify-staticcheck.sh
+	@which golangci-lint > /dev/null || (echo "golangci-lint not found, installing..." && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest)
+	golangci-lint run ./...
 
-.PHONY: verify
-verify:
-	hack/verify-all.sh
+## fmt: Run go fmt
+fmt:
+	@echo "Running go fmt..."
+	go fmt ./...
 
-.PHONY: lint_dockerfile
-lint_dockerfile:
-	@ docker run --rm \
-          -v $(ROOT_DIR)/.trivyignore:/.trivyignore \
-          -v /tmp/trivy:/root/trivy.cache/  \
-          -v $(ROOT_DIR):/tmp/src  \
-          aquasec/trivy:$(TRIVY_VERSION) config --exit-code 1  --severity $(LINT_TRIVY_SEVERITY_LEVEL) /tmp/src/docker  ; \
-      (($$?==0)) || { echo "error, failed to check dockerfile trivy" && exit 1 ; } ; \
-      echo "dockerfile trivy check: pass"
+## vet: Run go vet
+vet:
+	@echo "Running go vet..."
+	go vet ./...
 
-.PHONY: lint_chart
-lint_chart:
-	@ docker run --rm \
-          -v $(ROOT_DIR)/.trivyignore:/.trivyignore \
-          -v /tmp/trivy:/root/trivy.cache/  \
-          -v $(ROOT_DIR):/tmp/src  \
-          aquasec/trivy:$(TRIVY_VERSION) config --exit-code 1  --severity $(LINT_TRIVY_SEVERITY_LEVEL) /tmp/src/charts  ; \
-      (($$?==0)) || { echo "error, failed to check chart trivy" && exit 1 ; } ; \
-      echo "chart trivy check: pass"
+## tidy: Tidy go modules
+tidy:
+	@echo "Tidying go modules..."
+	go mod tidy
 
-.PHONY: e2e-env-setup
-e2e-env-setup:
-	./hack/e2e-test-setup.sh
+## generate: Run go generate
+generate:
+	@echo "Running go generate..."
+	go generate ./...
 
-.PHONY: helm-deploy
-helm-deploy:
-	./hack/deploy-helm.sh "${E2E_TYPE}" "${KUBE_CONF}" "${HAMI_VERSION}"
+## docker-build: Build Docker image
+docker-build:
+	@echo "Building Docker image $(REGISTRY)/$(BINARY_NAME):$(IMG_TAG)"
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) \
+		-t $(REGISTRY)/$(BINARY_NAME):$(IMG_TAG) .
 
-.PHONY: local-deploy
-local-deploy: docker
-	IMG_NAME="${IMG_NAME}" IMG_TAG="${IMG_TAG}" ./hack/deploy-helm.sh "local" "${KUBE_CONF}"
+## docker-push: Push Docker image to registry
+docker-push:
+	@echo "Pushing Docker image $(REGISTRY)/$(BINARY_NAME):$(IMG_TAG)"
+	docker push $(REGISTRY)/$(BINARY_NAME):$(IMG_TAG)
 
-.PHONY: e2e-test
-e2e-test:
-	./hack/e2e-test.sh "${E2E_TYPE}" "${KUBE_CONF}"
-
+## help: Show this help message
+help:
+	@echo "Usage: make [target]"
+	@echo ""
+	@echo "Targets:"
+	@sed -n 's/^##//p' $(MAKEFILE_LIST) | column -t -s ':' | sed -e 's/^/ /'
